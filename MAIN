@@ -1,0 +1,1106 @@
+#include <xc.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// Configuration bits (for PIC18F26K22 with external 4MHz crystal)
+#pragma config FOSC = HSMP      // External High Speed Medium Power Crystal Oscillator
+#pragma config PLLCFG = OFF     // 4X PLL disabled
+#pragma config PRICLKEN = ON    // Primary clock enabled
+#pragma config FCMEN = OFF      // Fail-Safe Clock Monitor disabled
+#pragma config IESO = OFF       // Internal/External Oscillator Switchover bit
+#pragma config WDTEN = ON       // Watchdog Timer enabled
+#pragma config PBADEN = OFF     // PORTB<5:0> pins are configured as digital I/O on Reset
+#pragma config LVP = OFF        // Single-Supply ICSP disabled
+#pragma config MCLRE = EXTMCLR  // MCLR pin enabled; RE3 input disabled
+
+#define _XTAL_FREQ 4000000      // Define oscillator frequency for __delay_ms()
+
+#define UART_RX_BUFFER_SIZE 256
+#define UART_TX_BUFFER_SIZE 256
+#define MAX_SMS_LENGTH 160
+#define PHONE_NUMBER_LENGTH 15
+#define GPS_BUFFER_SIZE 128     // Size of GPS data buffer
+
+// M95 module control pin
+#define M95_PWR_KEY LATCbits.LATC0
+#define M95_PWR_KEY_TRIS TRISCbits.TRISC0
+
+// LED control pin for GSM notifications
+#define LED LATAbits.LATA1
+#define LED_TRIS TRISAbits.TRISA1
+
+// LED2 control pin for GPS notifications
+#define LED2 LATAbits.LATA2
+#define LED2_TRIS TRISAbits.TRISA2
+
+// LED3 control pin for SMS notifications
+#define LED3 LATAbits.LATA3
+#define LED3_TRIS TRISAbits.TRISA3
+
+#define MAX_RETRIES 3     // Define the maximum number of retries for AT commands
+#define MAX_GSM_RESTARTS 2 // Limit GSM module restarts to prevent endless loops
+#define MAX_SYSTEM_RESTARTS 3 // Limit system restarts to prevent endless loops
+
+#define MAX_GEOFENCES 10
+#define MAX_POINTS_PER_GEOFENCE 10
+
+typedef struct {
+    char phoneNumber[PHONE_NUMBER_LENGTH + 1];
+    char message[MAX_SMS_LENGTH + 1];
+} SMS;
+
+typedef struct {
+    double latitude;
+    double longitude;
+} Point;
+
+typedef struct {
+    uint8_t serialNumber;
+    uint8_t numPoints;
+    Point points[MAX_POINTS_PER_GEOFENCE];
+    uint8_t speedLimit; // in integer
+} Geofence;
+
+// Global variables for UART2 (GSM module)
+volatile char uartRxBuffer[UART_RX_BUFFER_SIZE];
+volatile uint16_t uartRxBufferHead = 0;
+volatile uint16_t uartRxBufferTail = 0;
+
+volatile char uartTxBuffer[UART_TX_BUFFER_SIZE];
+volatile uint16_t uartTxBufferHead = 0;
+volatile uint16_t uartTxBufferTail = 0;
+volatile bool uartTxInProgress = false;
+
+volatile SMS incomingSMS;
+volatile bool newSMSReceived = false;
+
+// Global variables for UART1 (GPS module)
+volatile char gpsBuffer[GPS_BUFFER_SIZE];
+volatile uint8_t bufferIndex = 0;
+volatile bool newDataAvailable = false;
+
+// Variables to store last known GPS location
+char lastLatitude[15] = {0};
+char lastLongitude[15] = {0};
+char latDirection = 'N';
+char lonDirection = 'E';
+
+// GSM module state variables
+bool gsmNeedsInitialization = true;
+int gsmRestartCount = 0;
+int systemRestartCount = 0;
+
+// Error counters
+volatile uint8_t uartErrorCount1 = 0;
+volatile uint8_t uartErrorCount2 = 0;
+
+// Geofence data
+Geofence geofences[MAX_GEOFENCES];
+uint8_t numGeofences = 0;
+
+// Function prototypes
+void SYSTEM_Initialize(void);
+void UART1_Initialize(void);
+void UART2_Initialize(void);
+void UART2_SendChar(char c);
+void UART2_SendString(const char* str);
+bool UART2_IsRxReady(void);
+char UART2_ReadChar(void);
+void M95_PowerOn(void);
+void M95_PowerOff(void);
+void blinkLED(int count);
+void turnOnLED(void);
+void turnOnLED2(void);
+void turnOffLED2(void);
+void turnOnLED3(void);
+void turnOffLED3(void);
+void blinkLED3(int count);
+void sendATCommand(const char* command);
+bool waitForResponse(const char* expectedResponse, uint16_t timeout);
+bool sendATCommandWithRetry(const char* command, const char* expectedResponse, uint16_t timeout);
+void initializeGSMModule(void);
+void initializeSMS(void);
+void processSMSNotification(const char* notification);
+void processSMSContent(const char* content);
+void handleSMS(void);
+void sendSMS(const char* phoneNumber, const char* message);
+void deleteSMS(void);
+void checkSMSAndControlLED(void);
+void parseGPSData(const char* gpsData);
+void convertToDecimalDegrees(const char* nmea, char* result);
+void UART_ErrorHandler(void);
+void restartGSMModule(void);
+void systemRestart(void);
+void UART1_SendString(const char* str);
+
+// Geofence management functions
+void addGeofence(Geofence *newGeofence);
+void editGeofence(uint8_t serialNumber, Geofence *updatedGeofence);
+void deleteGeofence(uint8_t serialNumber);
+void deleteAllGeofences(void);
+Geofence* getGeofenceBySerialNumber(uint8_t serialNumber);
+bool isPointInGeofence(double latitude, double longitude, Geofence *geofence);
+
+// SMS command processing functions
+void processAddGeofenceCommand(char *message);
+void processEditGeofenceCommand(char *message);
+void processDeleteGeofenceCommand(char *message);
+void processViewGeofencesCommand(void);
+
+// EEPROM functions
+void EEPROM_WriteByte(uint16_t address, uint8_t data);
+uint8_t EEPROM_ReadByte(uint16_t address);
+void EEPROM_WriteBlock(uint16_t address, uint8_t *data, uint16_t length);
+void EEPROM_ReadBlock(uint16_t address, uint8_t *data, uint16_t length);
+void loadGeofencesFromEEPROM(void);
+void saveGeofencesToEEPROM(void);
+
+void __interrupt() ISR(void)
+{
+    // UART2 Receive Interrupt (GSM module)
+    if(PIR3bits.RC2IF)
+    {
+        // Check for overrun and framing errors
+        if(RCSTA2bits.OERR || RCSTA2bits.FERR)
+        {
+            UART_ErrorHandler();
+            uartErrorCount2++;
+        }
+
+        char receivedChar = RCREG2;
+        uint16_t nextHead = (uartRxBufferHead + 1) % UART_RX_BUFFER_SIZE;
+
+        if(nextHead != uartRxBufferTail)
+        {
+            uartRxBuffer[uartRxBufferHead] = receivedChar;
+            uartRxBufferHead = nextHead;
+        }
+    }
+
+    // UART2 Transmit Interrupt
+    if(PIR3bits.TX2IF && PIE3bits.TX2IE)
+    {
+        if(uartTxBufferHead != uartTxBufferTail)
+        {
+            TXREG2 = uartTxBuffer[uartTxBufferTail];
+            uartTxBufferTail = (uartTxBufferTail + 1) % UART_TX_BUFFER_SIZE;
+        }
+        else
+        {
+            PIE3bits.TX2IE = 0;  // Disable TX interrupt when buffer is empty
+            uartTxInProgress = false;
+        }
+    }
+
+    // UART1 Receive Interrupt (GPS module)
+    if(PIR1bits.RC1IF)
+    {
+        if(RCSTA1bits.OERR || RCSTA1bits.FERR)
+        {
+            UART_ErrorHandler();
+            uartErrorCount1++;
+        }
+
+        char receivedChar = RCREG1;
+        if(bufferIndex < GPS_BUFFER_SIZE - 1)
+        {
+            gpsBuffer[bufferIndex++] = receivedChar;
+            if(receivedChar == '\n')
+            {
+                gpsBuffer[bufferIndex] = '\0';
+                newDataAvailable = true;
+                bufferIndex = 0;
+            }
+        }
+        else
+        {
+            bufferIndex = 0; // Reset if buffer is full
+        }
+        PIR1bits.RC1IF = 0; // Clear the interrupt flag
+    }
+}
+
+void main(void)
+{
+    SYSTEM_Initialize();
+    UART2_Initialize();  // Initialize UART2 for GSM module
+    UART1_Initialize();  // Initialize UART1 for GPS module
+
+    // Enable global and peripheral interrupts
+    INTCONbits.GIE = 1;
+    INTCONbits.PEIE = 1;
+
+    M95_PowerOn();
+    __delay_ms(3000);
+    blinkLED(2);  // Blink twice to indicate start
+
+    // Send welcome message
+    UART2_SendString("UART Driver Test\r\n");
+    UART2_SendString("SMS Control System Initialized.\r\n");
+
+    gsmNeedsInitialization = true;
+    gsmRestartCount = 0;
+    systemRestartCount = 0;
+
+    loadGeofencesFromEEPROM(); // Load geofences from EEPROM
+
+    while(1)
+    {
+        CLRWDT();  // Clear watchdog timer
+
+        if (gsmNeedsInitialization)
+        {
+            initializeGSMModule();
+            if (gsmNeedsInitialization == false)
+            {
+                blinkLED(3);  // Blink thrice to indicate successful initialization
+            }
+        }
+        else
+        {
+            checkSMSAndControlLED();
+
+            if(newDataAvailable)
+            {
+                parseGPSData(gpsBuffer);
+                newDataAvailable = false;
+            }
+        }
+
+        // Check if UART errors exceeded threshold
+        if (uartErrorCount1 > 5 || uartErrorCount2 > 5)
+        {
+            if (systemRestartCount < MAX_SYSTEM_RESTARTS)
+            {
+                systemRestartCount++;
+                systemRestart();
+            }
+            else
+            {
+                UART2_SendString("Critical error: System is restarting due to repeated UART errors.\r\n");
+                while(1);  // Halt the system if it cannot recover
+            }
+            uartErrorCount1 = 0;
+            uartErrorCount2 = 0;
+        }
+
+        CLRWDT();  // Clear watchdog timer during idle loop to avoid reset
+
+        __delay_ms(100);  // Small delay to prevent tight looping
+    }
+}
+
+void SYSTEM_Initialize(void)
+{
+    // Configure RC0 as output for M95_PWR_KEY and set it high (PWR_KEY pulled to GND)
+    M95_PWR_KEY_TRIS = 0;
+    M95_PWR_KEY = 1;  // Initially keep PWR_KEY grounded
+
+    // Configure RA1 as output for LED
+    LED_TRIS = 0;
+    LED = 0;  // Initially turn off LED
+
+    // Configure RA2 as output for LED2 (GPS notification)
+    LED2_TRIS = 0;
+    LED2 = 0;  // Initially turn off LED2
+
+    // Configure RA3 as output for LED3 (SMS notification)
+    LED3_TRIS = 0;
+    LED3 = 0;  // Initially turn off LED3
+}
+
+void UART1_Initialize(void)
+{
+    // Set UART1 pins
+    ANSELCbits.ANSC6 = 0;  // Disable analog function for RC6 (TX1)
+    ANSELCbits.ANSC7 = 0;  // Disable analog function for RC7 (RX1)
+    TRISCbits.TRISC6 = 0;  // TX1 pin as output
+    TRISCbits.TRISC7 = 1;  // RX1 pin as input
+
+    // Configure UART1
+    TXSTA1bits.TXEN = 1;   // Enable transmitter
+    RCSTA1bits.SPEN = 1;   // Enable serial port
+    RCSTA1bits.CREN = 1;   // Enable continuous reception
+
+    // Set baud rate to 9600
+    BAUDCON1bits.BRG16 = 1;  // Use 16-bit baud rate generator
+    TXSTA1bits.BRGH = 1;     // High-speed baud rate
+    SPBRGH1 = 0;             // For 9600 baud at 4MHz
+    SPBRG1 = 103;            // 103 for 9600 baud
+
+    // Enable UART1 receive interrupt
+    PIE1bits.RC1IE = 1;
+}
+
+void UART2_Initialize(void)
+{
+    // Set UART2 pins
+    TRISBbits.TRISB6 = 0;  // RB6 (TX2) as output
+    TRISBbits.TRISB7 = 1;  // RB7 (RX2) as input
+
+    // Configure UART2
+    TXSTA2bits.TXEN = 1;   // Enable transmitter
+    RCSTA2bits.SPEN = 1;   // Enable serial port
+    RCSTA2bits.CREN = 1;   // Enable continuous reception
+
+    // Set baud rate to 9600
+    BAUDCON2bits.BRG16 = 1;  // Use 16-bit baud rate generator
+    TXSTA2bits.BRGH = 1;     // High-speed baud rate
+    SPBRGH2 = 0;             // For 9600 baud at 4MHz
+    SPBRG2 = 103;            // 103 for 9600 baud
+
+    // Enable UART2 receive interrupt
+    PIE3bits.RC2IE = 1;
+
+    // Transmit interrupt is initially disabled, enabled when sending data
+    PIE3bits.TX2IE = 0;
+}
+
+void UART2_SendChar(char c)
+{
+    uint16_t nextHead = (uartTxBufferHead + 1) % UART_TX_BUFFER_SIZE;
+
+    while(nextHead == uartTxBufferTail)
+    {
+        CLRWDT();  // Clear watchdog timer while waiting for buffer space
+    }
+
+    uartTxBuffer[uartTxBufferHead] = c;
+    uartTxBufferHead = nextHead;
+
+    if(!uartTxInProgress)
+    {
+        uartTxInProgress = true;
+        PIE3bits.TX2IE = 1;  // Enable TX interrupt to start transmission
+    }
+}
+
+void UART2_SendString(const char* str)
+{
+    while(*str != '\0')
+    {
+        UART2_SendChar(*str);
+        str++;
+        CLRWDT();  // Clear watchdog timer while sending data
+    }
+}
+
+bool UART2_IsRxReady(void)
+{
+    return (uartRxBufferHead != uartRxBufferTail);
+}
+
+char UART2_ReadChar(void)
+{
+    char data = 0;
+
+    if(uartRxBufferHead != uartRxBufferTail)
+    {
+        data = uartRxBuffer[uartRxBufferTail];
+        uartRxBufferTail = (uartRxBufferTail + 1) % UART_RX_BUFFER_SIZE;
+    }
+
+    return data;
+}
+
+void M95_PowerOn(void)
+{
+    M95_PWR_KEY = 0;  // Release PWR_KEY (disconnect from ground)
+    __delay_ms(1000); // Hold for 1 second
+    M95_PWR_KEY = 1;  // Pull PWR_KEY back to ground
+    __delay_ms(2000); // Wait for 2 seconds after releasing PWR_KEY
+    CLRWDT();  // Clear watchdog timer after power sequence
+}
+
+void M95_PowerOff(void)
+{
+    M95_PWR_KEY = 0;  // Release PWR_KEY (disconnect from ground)
+    __delay_ms(3000); // Hold for 3 seconds
+    M95_PWR_KEY = 1;  // Pull PWR_KEY back to ground
+    CLRWDT();  // Clear watchdog timer after power sequence
+}
+
+void blinkLED(int count)
+{
+    for(int i = 0; i < count; i++) {
+        LED = 1;
+        __delay_ms(500);
+        LED = 0;
+        __delay_ms(500);
+        CLRWDT();  // Clear watchdog timer during LED blink
+    }
+}
+
+void turnOnLED(void)
+{
+    LED = 1;  // Turn on LED
+    CLRWDT();  // Clear watchdog timer after turning on LED
+}
+
+void turnOnLED2(void)
+{
+    LED2 = 1;  // Turn on LED2 (GPS fix notification)
+    CLRWDT();  // Clear watchdog timer after turning on LED2
+}
+
+void turnOffLED2(void)
+{
+    LED2 = 0;  // Turn off LED2 (GPS fix notification)
+    CLRWDT();  // Clear watchdog timer after turning off LED2
+}
+
+void turnOnLED3(void) {
+    LED3 = 1;  // Turn on LED3 (SMS activity notification)
+    CLRWDT();  // Clear watchdog timer after turning on LED3
+}
+
+void turnOffLED3(void) {
+    LED3 = 0;  // Turn off LED3 (SMS activity notification)
+    CLRWDT();  // Clear watchdog timer after turning off LED3
+}
+
+void blinkLED3(int count) {
+    for (int i = 0; i < count; i++) {
+        LED3 = 1;
+        __delay_ms(300);
+        LED3 = 0;
+        __delay_ms(300);
+        CLRWDT();  // Clear watchdog timer during LED blink
+    }
+}
+
+void sendATCommand(const char* command)
+{
+    UART2_SendString(command);
+    UART2_SendString("\r\n");
+    CLRWDT();  // Clear watchdog timer after sending command
+}
+
+bool waitForResponse(const char* expectedResponse, uint16_t timeout)
+{
+    char response[UART_RX_BUFFER_SIZE] = {0};
+    uint16_t index = 0;
+    uint16_t timer = 0;
+
+    while(timer < timeout)
+    {
+        CLRWDT();  // Clear watchdog timer while waiting for response
+        if(UART2_IsRxReady())
+        {
+            char c = UART2_ReadChar();
+            response[index++] = c;
+
+            if(strstr(response, expectedResponse) != NULL)
+            {
+                return true;  // Expected response received
+            }
+
+            if(index >= UART_RX_BUFFER_SIZE - 1)
+            {
+                index = 0;  // Reset buffer if it's full
+            }
+        }
+
+        __delay_ms(1);
+        timer++;
+    }
+
+    return false;  // Timeout occurred
+}
+
+bool sendATCommandWithRetry(const char* command, const char* expectedResponse, uint16_t timeout) {
+    int retryCount = 0;
+    bool commandSuccess = false;
+
+    // Retry sending the AT command up to MAX_RETRIES times
+    while (retryCount < MAX_RETRIES && !commandSuccess) {
+        sendATCommand(command);
+        commandSuccess = waitForResponse(expectedResponse, timeout);
+
+        if (!commandSuccess) {
+            retryCount++;
+            __delay_ms(1000);  // Small delay before retrying
+            CLRWDT();  // Clear watchdog timer during retry delay
+        }
+    }
+
+    return commandSuccess;
+}
+
+void initializeGSMModule(void) {
+    gsmNeedsInitialization = false;  // Assume initialization will succeed
+
+    // Retry sending AT commands with limits
+    if (!sendATCommandWithRetry("AT", "OK", 2000) ||
+        !sendATCommandWithRetry("ATV1", "OK", 2000) ||
+        !sendATCommandWithRetry("ATE0", "OK", 2000) ||
+        !sendATCommandWithRetry("AT+CMEE=2", "OK", 2000) ||
+        !sendATCommandWithRetry("AT+CREG?", "+CREG: 0,1", 10000) ||
+        !sendATCommandWithRetry("AT+CGREG?", "+CGREG: 0,1", 5000) ||
+        !sendATCommandWithRetry("AT+COPS?", "OK", 5000)) {
+
+        // If initialization fails after retries, try restarting the GSM module
+        if (gsmRestartCount < MAX_GSM_RESTARTS) {
+            gsmRestartCount++;
+            restartGSMModule();
+            gsmNeedsInitialization = true;  // Indicate that we need to initialize again
+        } else {
+            // Log a critical error if GSM cannot be restarted
+            UART2_SendString("Critical error: GSM module failed to initialize.\r\n");
+            gsmNeedsInitialization = false;  // Stop trying
+        }
+    } else {
+        // Reset the restart count if GSM initializes successfully
+        gsmRestartCount = 0;
+        initializeSMS();  // Initialize SMS settings
+    }
+}
+
+void initializeSMS(void)
+{
+    // Initialize SMS-related settings
+    sendATCommandWithRetry("AT+CMGF=1", "OK", 1000); // Set SMS text mode
+    sendATCommandWithRetry("AT+CNMI=2,2,0,0,0", "OK", 1000); // Configure new message indications
+    CLRWDT();  // Clear watchdog timer after initializing SMS
+}
+
+void processSMSNotification(const char* notification)
+{
+    // Extract phone number from notification
+    char* start = strstr(notification, "\"");
+    char* end = strstr(start + 1, "\"");
+    if (start && end && (end - start - 1 < PHONE_NUMBER_LENGTH))
+    {
+        strncpy((char*)incomingSMS.phoneNumber, start + 1, end - start - 1);
+        incomingSMS.phoneNumber[end - start - 1] = '\0';
+    }
+    CLRWDT();  // Clear watchdog timer after processing notification
+}
+
+void processSMSContent(const char* content)
+{
+    blinkLED3(3);  // Blink LED3 three times to indicate SMS received
+
+    strncpy((char*)incomingSMS.message, content, MAX_SMS_LENGTH);
+    incomingSMS.message[MAX_SMS_LENGTH] = '\0';
+    newSMSReceived = true;
+    CLRWDT();  // Clear watchdog timer after processing SMS content
+}
+
+void handleSMS(void)
+{
+    if (newSMSReceived)
+    {
+        newSMSReceived = false;
+        char *message = (char*)incomingSMS.message;
+        if (strncmp(message, "ON", 2) == 0)
+        {
+            turnOnLED();
+            sendSMS((char*)incomingSMS.phoneNumber, "LED turned ON");
+        }
+        else if (strncmp(message, "OFF", 3) == 0)
+        {
+            LED = 0;  // Turn off LED
+            sendSMS((char*)incomingSMS.phoneNumber, "LED turned OFF");
+        }
+        else if (strncmp(message, "LOC", 3) == 0)
+        {
+            char msg[160];
+            sprintf(msg, "Lat: %s%c, Long: %s%c", lastLatitude, latDirection, lastLongitude, lonDirection);
+            sendSMS((char*)incomingSMS.phoneNumber, msg);
+        }
+        else if (strncmp(message, "ADDGEO", 6) == 0)
+        {
+            processAddGeofenceCommand(message);
+            sendSMS((char*)incomingSMS.phoneNumber, "Geofence added");
+        }
+        else if (strncmp(message, "EDITGEO", 7) == 0)
+        {
+            processEditGeofenceCommand(message);
+            sendSMS((char*)incomingSMS.phoneNumber, "Geofence edited");
+        }
+        else if (strncmp(message, "DELETEGEO", 9) == 0)
+        {
+            processDeleteGeofenceCommand(message);
+            sendSMS((char*)incomingSMS.phoneNumber, "Geofence deleted");
+        }
+        else if (strncmp(message, "DELETEALLGEO", 12) == 0)
+        {
+            deleteAllGeofences();
+            sendSMS((char*)incomingSMS.phoneNumber, "All geofences deleted");
+        }
+        else if (strncmp(message, "VIEWGEO", 7) == 0)
+        {
+            processViewGeofencesCommand();
+        }
+        // No else clause - we don't send any message for invalid commands
+        deleteSMS();
+    }
+    CLRWDT();  // Clear watchdog timer after handling SMS
+}
+
+void sendSMS(const char* phoneNumber, const char* message)
+{
+    char atCommand[50];
+    sprintf(atCommand, "AT+CMGS=\"%s\"", phoneNumber);
+
+    turnOnLED3();  // Turn on LED3 to indicate SMS sending
+
+    sendATCommand(atCommand);
+    if (waitForResponse(">", 5000))
+    {
+        UART2_SendString(message);
+        UART2_SendChar(0x1A);  // Ctrl+Z to end message
+        waitForResponse("OK", 10000);
+    }
+
+    turnOffLED3();  // Turn off LED3 after SMS send complete
+    CLRWDT();  // Clear watchdog timer after sending SMS
+}
+
+void deleteSMS(void)
+{
+    sendATCommandWithRetry("AT+CMGD=1,4", "OK", 5000);  // Delete all SMS
+    CLRWDT();  // Clear watchdog timer after deleting SMS
+}
+
+void checkSMSAndControlLED(void)
+{
+    static char buffer[256] = {0};
+    static int bufferIndex = 0;
+    static bool expectingMessageBody = false;
+
+    while(UART2_IsRxReady())
+    {
+        char c = UART2_ReadChar();
+
+        if(bufferIndex < sizeof(buffer) - 1)
+        {
+            buffer[bufferIndex++] = c;
+        }
+
+        if(c == '\n' || bufferIndex >= sizeof(buffer) - 1)
+        {
+            buffer[bufferIndex] = '\0';  // Null-terminate the string
+
+            if(strncmp(buffer, "+CMT: ", 6) == 0)
+            {
+                processSMSNotification(buffer);
+                expectingMessageBody = true;
+            }
+            else if(expectingMessageBody)
+            {
+                processSMSContent(buffer);
+                expectingMessageBody = false;
+                handleSMS();  // Process the SMS immediately after receiving the body
+            }
+
+            // Reset buffer for next line
+            bufferIndex = 0;
+            memset(buffer, 0, sizeof(buffer));
+        }
+        CLRWDT();  // Clear watchdog timer during SMS check loop
+    }
+}
+
+void parseGPSData(const char* gpsData)
+{
+    if(strncmp(gpsData, "$GNRMC,", 7) == 0)
+    {
+        char latitude[15] = {0};
+        char longitude[15] = {0};
+        char tempLatDirection = 'N';
+        char tempLonDirection = 'E';
+        char* token;
+        int field = 0;
+
+        char gpsDataCopy[GPS_BUFFER_SIZE];
+        strncpy(gpsDataCopy, gpsData, GPS_BUFFER_SIZE);
+
+        token = strtok(gpsDataCopy, ",");
+        while(token != NULL)
+        {
+            if(field == 3) // Latitude
+            {
+                strncpy(latitude, token, sizeof(latitude) - 1);
+            }
+            else if(field == 4) // Latitude direction
+            {
+                tempLatDirection = token[0];
+            }
+            else if(field == 5) // Longitude
+            {
+                strncpy(longitude, token, sizeof(longitude) - 1);
+            }
+            else if(field == 6) // Longitude direction
+            {
+                tempLonDirection = token[0];
+            }
+            token = strtok(NULL, ",");
+            field++;
+        }
+
+        if(latitude[0] != '\0' && longitude[0] != '\0')
+        {
+            char latDecimal[15], lonDecimal[15];
+            convertToDecimalDegrees(latitude, latDecimal);
+            convertToDecimalDegrees(longitude, lonDecimal);
+
+            strncpy(lastLatitude, latDecimal, sizeof(lastLatitude) - 1);
+            strncpy(lastLongitude, lonDecimal, sizeof(lastLongitude) - 1);
+            latDirection = tempLatDirection;
+            lonDirection = tempLonDirection;
+
+            turnOnLED2();  // Indicate GPS fix obtained
+
+            // Check if current location is inside any geofence
+            double currentLatitude = atof(lastLatitude);
+            double currentLongitude = atof(lastLongitude);
+
+            for (int i = 0; i < numGeofences; i++) {
+                Geofence *g = &geofences[i];
+                if (isPointInGeofence(currentLatitude, currentLongitude, g)) {
+                    // Send speed limit via UART1 TX
+                    char speedStr[10];
+                    sprintf(speedStr, "%d", g->speedLimit);
+                    UART1_SendString(speedStr);
+                    UART1_SendString("\r\n");
+                    break; // Assuming only one geofence is active at a time
+                }
+            }
+
+        }
+        else
+        {
+            turnOffLED2();  // Indicate GPS fix lost
+        }
+    }
+    CLRWDT();  // Clear watchdog timer after parsing GPS data
+}
+
+void convertToDecimalDegrees(const char* nmea, char* result)
+{
+    double value = atof(nmea);
+    int degrees = (int)(value / 100);
+    double minutes = value - (degrees * 100);
+    double decimalDegrees = degrees + (minutes / 60.0);
+    sprintf(result, "%.6f", decimalDegrees);
+    CLRWDT();  // Clear watchdog timer after conversion
+}
+
+void UART_ErrorHandler(void)
+{
+    if(RCSTA1bits.OERR) // Overrun error for UART1
+    {
+        RCSTA1bits.CREN = 0;
+        RCSTA1bits.CREN = 1;
+    }
+    if(RCSTA1bits.FERR) // Framing error for UART1
+    {
+        char dummy = RCREG1;  // Read invalid data to clear the error
+    }
+
+    if(RCSTA2bits.OERR) // Overrun error for UART2
+    {
+        RCSTA2bits.CREN = 0;
+        RCSTA2bits.CREN = 1;
+    }
+    if(RCSTA2bits.FERR) // Framing error for UART2
+    {
+        char dummy = RCREG2;  // Read invalid data to clear the error
+    }
+    CLRWDT();  // Clear watchdog timer after handling UART error
+}
+
+void restartGSMModule(void)
+{
+    UART2_SendString("Restarting GSM module...\r\n");
+    M95_PowerOff();
+    __delay_ms(5000);  // Wait for a while before restarting
+    CLRWDT();  // Clear watchdog timer during GSM restart
+    M95_PowerOn();
+    __delay_ms(3000);  // Wait for GSM module to power up
+    CLRWDT();  // Clear watchdog timer after GSM power up
+
+    // Set flag to indicate GSM needs initialization
+    gsmNeedsInitialization = true;
+}
+
+void systemRestart(void)
+{
+    UART2_SendString("System is restarting...\r\n");
+    CLRWDT();  // Clear watchdog timer before system reset
+    asm("reset");  // Assembly instruction to reset the microcontroller
+}
+
+void UART1_SendString(const char* str)
+{
+    while(*str != '\0')
+    {
+        while(!TXSTA1bits.TRMT);
+        TXREG1 = *str++;
+    }
+}
+
+void addGeofence(Geofence *newGeofence) {
+    if (numGeofences < MAX_GEOFENCES) {
+        geofences[numGeofences] = *newGeofence;
+        numGeofences++;
+        saveGeofencesToEEPROM(); // Save to EEPROM after adding
+    } else {
+        // Handle error: Maximum number of geofences reached
+        UART2_SendString("Error: Maximum geofences reached.\r\n");
+    }
+}
+
+void editGeofence(uint8_t serialNumber, Geofence *updatedGeofence) {
+    for (int i = 0; i < numGeofences; i++) {
+        if (geofences[i].serialNumber == serialNumber) {
+            geofences[i] = *updatedGeofence;
+            saveGeofencesToEEPROM(); // Save to EEPROM after editing
+            return;
+        }
+    }
+    // Handle error: Geofence with given serial number not found
+    UART2_SendString("Error: Geofence not found.\r\n");
+}
+
+void deleteGeofence(uint8_t serialNumber) {
+    for (int i = 0; i < numGeofences; i++) {
+        if (geofences[i].serialNumber == serialNumber) {
+            // Shift remaining geofences down
+            for (int j = i; j < numGeofences - 1; j++) {
+                geofences[j] = geofences[j+1];
+            }
+            numGeofences--;
+            saveGeofencesToEEPROM(); // Save to EEPROM after deleting
+            return;
+        }
+    }
+    // Handle error: Geofence with given serial number not found
+    UART2_SendString("Error: Geofence not found.\r\n");
+}
+
+void deleteAllGeofences(void) {
+    numGeofences = 0;
+    saveGeofencesToEEPROM(); // Save to EEPROM after deleting all
+    UART2_SendString("All geofences deleted.\r\n");
+}
+
+Geofence* getGeofenceBySerialNumber(uint8_t serialNumber) {
+    for (int i = 0; i < numGeofences; i++) {
+        if (geofences[i].serialNumber == serialNumber) {
+            return &geofences[i];
+        }
+    }
+    return NULL; // Not found
+}
+
+bool isPointInGeofence(double latitude, double longitude, Geofence *geofence) {
+    int i, j;
+    bool inside = false;
+    for (i = 0, j = geofence->numPoints - 1; i < geofence->numPoints; j = i++) {
+        double xi = geofence->points[i].latitude;
+        double yi = geofence->points[i].longitude;
+        double xj = geofence->points[j].latitude;
+        double yj = geofence->points[j].longitude;
+        if (((yi > longitude) != (yj > longitude)) &&
+            (latitude < (xj - xi) * (longitude - yi) / (yj - yi) + xi)) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+void processAddGeofenceCommand(char *message)
+{
+    // Format: "ADDGEO,SN,SpeedLimit,P1_Lat,P1_Lon,P2_Lat,P2_Lon,..."
+    Geofence newGeofence;
+    memset(&newGeofence, 0, sizeof(Geofence));
+    char *token;
+    int field = 0;
+    token = strtok(message, ",");
+    while (token != NULL)
+    {
+        if (field == 1)
+        {
+            newGeofence.serialNumber = (uint8_t)atoi(token);
+        }
+        else if (field == 2)
+        {
+            newGeofence.speedLimit = (uint8_t)atoi(token);
+        }
+        else if (field >= 3)
+        {
+            int pointIndex = (field - 3) / 2;
+            if (pointIndex < MAX_POINTS_PER_GEOFENCE)
+            {
+                if ((field - 3) % 2 == 0)
+                {
+                    // Latitude
+                    newGeofence.points[pointIndex].latitude = atof(token);
+                }
+                else
+                {
+                    // Longitude
+                    newGeofence.points[pointIndex].longitude = atof(token);
+                    newGeofence.numPoints = pointIndex + 1;
+                }
+            }
+        }
+        token = strtok(NULL, ",");
+        field++;
+    }
+    addGeofence(&newGeofence);
+}
+
+void processEditGeofenceCommand(char *message)
+{
+    // Format: "EDITGEO,SN,SpeedLimit,P1_Lat,P1_Lon,P2_Lat,P2_Lon,..."
+    Geofence updatedGeofence;
+    memset(&updatedGeofence, 0, sizeof(Geofence));
+    char *token;
+    int field = 0;
+    token = strtok(message, ",");
+    while (token != NULL)
+    {
+        if (field == 1)
+        {
+            updatedGeofence.serialNumber = (uint8_t)atoi(token);
+        }
+        else if (field == 2)
+        {
+            updatedGeofence.speedLimit = (uint8_t)atoi(token);
+        }
+        else if (field >= 3)
+        {
+            int pointIndex = (field - 3) / 2;
+            if (pointIndex < MAX_POINTS_PER_GEOFENCE)
+            {
+                if ((field - 3) % 2 == 0)
+                {
+                    // Latitude
+                    updatedGeofence.points[pointIndex].latitude = atof(token);
+                }
+                else
+                {
+                    // Longitude
+                    updatedGeofence.points[pointIndex].longitude = atof(token);
+                    updatedGeofence.numPoints = pointIndex + 1;
+                }
+            }
+        }
+        token = strtok(NULL, ",");
+        field++;
+    }
+    editGeofence(updatedGeofence.serialNumber, &updatedGeofence);
+}
+
+void processDeleteGeofenceCommand(char *message)
+{
+    // Format: "DELETEGEO,SN"
+    char *token;
+    int field = 0;
+    int serialNumber = -1;
+    token = strtok(message, ",");
+    while (token != NULL)
+    {
+        if (field == 1)
+        {
+            serialNumber = atoi(token);
+            break;
+        }
+        token = strtok(NULL, ",");
+        field++;
+    }
+    if (serialNumber != -1)
+    {
+        deleteGeofence((uint8_t)serialNumber);
+    }
+}
+
+void processViewGeofencesCommand(void)
+{
+    // Build message containing geofence info
+    char message[160];
+    int offset = 0;
+    for (int i = 0; i < numGeofences; i++)
+    {
+        Geofence *g = &geofences[i];
+        offset += sprintf(message + offset, "SN:%d,Speed:%d;", g->serialNumber, g->speedLimit);
+        if (offset >= 150)
+            break;
+    }
+    sendSMS((char*)incomingSMS.phoneNumber, message);
+}
+
+// EEPROM functions
+void EEPROM_WriteByte(uint16_t address, uint8_t data)
+{
+    while(EECON1bits.WR); // Wait for any write operation to complete
+    EEADRH = (uint8_t)(address >> 8);
+    EEADR = (uint8_t)(address & 0x00FF);
+    EEDATA = data;
+    EECON1bits.EEPGD = 0; // Access data EEPROM memory
+    EECON1bits.CFGS = 0;  // Access EEPROM not config
+    EECON1bits.WREN = 1;  // Enable write
+
+    // Required sequence to write data
+    INTCONbits.GIE = 0; // Disable interrupts
+    EECON2 = 0x55;
+    EECON2 = 0xAA;
+    EECON1bits.WR = 1;   // Initiate write
+    INTCONbits.GIE = 1;  // Enable interrupts
+
+    EECON1bits.WREN = 0; // Disable write
+    while(EECON1bits.WR); // Wait for write to complete
+}
+
+uint8_t EEPROM_ReadByte(uint16_t address)
+{
+    EEADRH = (uint8_t)(address >> 8);
+    EEADR = (uint8_t)(address & 0x00FF);
+    EECON1bits.EEPGD = 0; // Access data EEPROM memory
+    EECON1bits.CFGS = 0;  // Access EEPROM not config
+    EECON1bits.RD = 1;    // Start read
+    return EEDATA;
+}
+
+void EEPROM_WriteBlock(uint16_t address, uint8_t *data, uint16_t length)
+{
+    for(uint16_t i = 0; i < length; i++)
+    {
+        EEPROM_WriteByte(address + i, data[i]);
+        CLRWDT();  // Clear watchdog timer during EEPROM write
+    }
+}
+
+void EEPROM_ReadBlock(uint16_t address, uint8_t *data, uint16_t length)
+{
+    for(uint16_t i = 0; i < length; i++)
+    {
+        data[i] = EEPROM_ReadByte(address + i);
+        CLRWDT();  // Clear watchdog timer during EEPROM read
+    }
+}
+
+void loadGeofencesFromEEPROM(void)
+{
+    uint16_t address = 0x0000;
+    EEPROM_ReadBlock(address, (uint8_t*)&numGeofences, sizeof(numGeofences));
+    if (numGeofences > MAX_GEOFENCES)
+        numGeofences = 0;
+    address += sizeof(numGeofences);
+    EEPROM_ReadBlock(address, (uint8_t*)geofences, sizeof(Geofence) * numGeofences);
+}
+
+void saveGeofencesToEEPROM(void)
+{
+    uint16_t address = 0x0000;
+    EEPROM_WriteBlock(address, (uint8_t*)&numGeofences, sizeof(numGeofences));
+    address += sizeof(numGeofences);
+    EEPROM_WriteBlock(address, (uint8_t*)geofences, sizeof(Geofence) * numGeofences);
+}
